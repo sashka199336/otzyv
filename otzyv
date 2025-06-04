@@ -43,8 +43,8 @@ VALID_PROJECT_IDS = [
 
 # Список допустимых токенов авторизации
 VALID_TOKENS = [
-    "Bearer 7e4e3c6b-4b5f-4e7c-9b8c-7f60e6c7e4f5",
-    "Bearer 8e4e3c6b-7b5f-4e7c-5b8c-7f60e6c7e4f5"
+    "Bearer ",
+    "Bearer "
 ]
 
 # Модель для создания отзыва (POST)
