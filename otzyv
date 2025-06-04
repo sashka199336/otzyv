@@ -1,0 +1,692 @@
+from flask import Flask, request
+from flask_restx import Api, Resource, fields, marshal
+from datetime import datetime
+import uuid
+import re
+import requests
+from requests.exceptions import RequestException
+
+app = Flask(__name__)
+
+
+api = Api(app, title="Отзывы API", description="Сервис для управления отзывами")
+
+
+api_version = "1"
+
+# Конфигурация внешнего API на reg.maibo.skroy.ru
+EXTERNAL_API_BASE_URL = "http://127.0.0.1:8080/api"
+EXTERNAL_API_TIMEOUT = 30  # таймаут в секундах
+EXTERNAL_API_TOKEN = "Bearer YOUR_API_TOKEN"  # Замените на ваш токен
+
+# Определение обязательныйх заголовков
+auth_parser = api.parser()
+auth_parser.add_argument('Authorization', location='headers', required=True,
+                         help='Токен авторизации в формате "Bearer <token>"')
+auth_parser.add_argument('Project-ID', location='headers', required=True,
+                         help='Идентификатор проекта в формате UUID')
+auth_parser.add_argument('Content-Type', location='headers', required=True,
+                         default='application/json', help='Тип содержимого запроса')
+
+# Пространство имен для отзывов (множественное число - для GET запросов)
+reviews_ns = api.namespace('reviews', description='Получение информации о отзывах')
+
+# Пространство имен для отзыва (единственное число - для POST и DELETE)
+review_ns = api.namespace('review', description='Добавление и удаление отзывов')
+
+# Список допустимых project_id
+VALID_PROJECT_IDS = [
+    "7bad8c49-6e57-4347-9e14-ebc056c21136",
+    "b5a8a6d7-3d84-4d9f-8c7a-2e780f3c5f6a",
+    "d1e4f8a2-590e-4b0e-9a4c-1a2c1d9e3a7b"
+]
+
+# Список допустимых токенов авторизации
+VALID_TOKENS = [
+    "Bearer 7e4e3c6b-4b5f-4e7c-9b8c-7f60e6c7e4f5",
+    "Bearer 8e4e3c6b-7b5f-4e7c-5b8c-7f60e6c7e4f5"
+]
+
+# Модель для создания отзыва (POST)
+review_create_model = review_ns.model('ReviewCreate', {
+    'user_id': fields.String(required=True, description='ID пользователя в формате UUID'),
+    'review_type': fields.String(required=True, description='Тип отзыва (reviewlecture/reviewlecturer)'),
+    'item': fields.String(required=True, description='ID объекта (например, лекции или лектора)'),
+    'data': fields.Nested(review_ns.model('ReviewData', {
+        'scale': fields.Nested(review_ns.model('Scale', {
+            'total': fields.String(required=True, description='Средняя оценка'),
+            'scales': fields.Raw(required=True, description='Оценки по критериям')
+        })),
+        'text': fields.String(required=True, description='Текст отзыва'),
+        'video': fields.List(fields.Raw, description='Ссылки на видео'),
+        'image': fields.List(fields.Raw, description='Ссылки на изображения'),
+        'reviewer': fields.Nested(review_ns.model('Reviewer', {
+            'first_name': fields.String(required=True, description='Имя рецензента'),
+            'last_name': fields.String(required=True, description='Фамилия рецензента'),
+            'phone': fields.String(required=True, description='Телефон рецензента')
+        }))
+    }))
+})
+
+# Модель отзыва для ответа
+review_model = api.model('Review', {
+    'id': fields.String(description='ID отзыва'),
+    'item': fields.String(description='ID объекта'),
+    'review_type': fields.String(description='Тип отзыва'),
+    'review_data': fields.Nested(api.model('ReviewData', {
+        'created_date': fields.String(description='Дата создания отзыва'),
+        'modified_date': fields.String(description='Дата изменения отзыва'),
+        'scale': fields.Nested(api.model('Scale', {
+            'total': fields.String(description='Средняя оценка'),
+            'scales': fields.Raw(description='Оценки по критериям')
+        })),
+        'text': fields.String(description='Текст отзыва'),
+        'video': fields.List(fields.Raw, description='Ссылки на видео'),
+        'image': fields.List(fields.Raw, description='Ссылки на изображения'),
+        'reviewer': fields.Nested(api.model('Reviewer', {
+            'first_name': fields.String(description='Имя рецензента'),
+            'last_name': fields.String(description='Фамилия рецензента'),
+            'phone': fields.String(description='Телефон рецензента')
+        }))
+    }))
+})
+
+# Стандартная модель ответа API
+api_response_model = api.model('ApiResponse', {
+    'detail': fields.Nested(api.model('Detail', {
+        'code': fields.String(description='Код результата операции'),
+        'message': fields.String(description='Сообщение о результате операции')
+    })),
+    'data': fields.Raw(description='Данные ответа'),
+    'info': fields.Nested(api.model('Info', {
+        'api_version': fields.String(description='Версия API')
+    }))
+})
+
+# Модель ответа со списком отзывов
+reviews_response_model = api.model('ReviewsResponse', {
+    'detail': fields.Nested(api.model('Detail', {
+        'code': fields.String(description='Код результата операции'),
+        'message': fields.String(description='Сообщение о результате операции')
+    })),
+    'data': fields.List(fields.Nested(review_model), description='Список отзывов'),
+    'info': fields.Nested(api.model('Info', {
+        'api_version': fields.String(description='Версия API')
+    }))
+})
+
+# Модель ответа с одним отзывом
+review_response_model = api.model('ReviewResponse', {
+    'detail': fields.Nested(api.model('Detail', {
+        'code': fields.String(description='Код результата операции'),
+        'message': fields.String(description='Сообщение о результате операции')
+    })),
+    'data': fields.Nested(review_model, description='Данные отзыва'),
+    'info': fields.Nested(api.model('Info', {
+        'api_version': fields.String(description='Версия API')
+    }))
+})
+
+# Модель ответа с ошибкой
+error_response_model = api.model('ErrorResponse', {
+    'detail': fields.Nested(api.model('Detail', {
+        'code': fields.String(description='Код ошибки'),
+        'message': fields.String(description='Сообщение об ошибке')
+    })),
+    'data': fields.Raw(description='Пустой объект'),
+    'info': fields.Nested(api.model('Info', {
+        'api_version': fields.String(description='Версия API')
+    }))
+})
+
+
+# Функция для взаимодействия с внешним API
+def call_external_api(method, endpoint, data=None, params=None, project_id=None):
+   
+    url = f"{EXTERNAL_API_BASE_URL}/{endpoint}"
+
+    headers = {
+        'Authorization': EXTERNAL_API_TOKEN,
+        'Content-Type': 'application/json'
+    }
+
+    if project_id:
+        headers['Project-ID'] = project_id
+
+    try:
+        if method.upper() == 'GET':
+            response = requests.get(url, params=params, headers=headers, timeout=EXTERNAL_API_TIMEOUT)
+        elif method.upper() == 'POST':
+            response = requests.post(url, json=data, headers=headers, timeout=EXTERNAL_API_TIMEOUT)
+        elif method.upper() == 'DELETE':
+            response = requests.delete(url, headers=headers, timeout=EXTERNAL_API_TIMEOUT)
+        else:
+            return None, wrap_response(501, f"Метод {method} не поддерживается")
+
+        response.raise_for_status()
+        return response.json(), None
+    except RequestException as e:
+        return None, wrap_response(
+            503 if 'ConnectTimeout' in str(e) else 500,
+            f"Ошибка при обращении к внешнему API: {str(e)}"
+        )
+
+
+def wrap_response(status, message=None, data=None):
+    """
+    Формирует унифицированный ответ API.
+    :param status: Статус HTTP-ответа (например, 200, 201, 400).
+    :param message: Сообщение для клиента.
+    :param data: Дополнительные данные (если есть).
+    :return: Словарь в формате {detail, data, info}, HTTP-статус.
+    """
+    # Преобразуем коды статуса в текстовые коды прикладного уровня
+    status_code_mapping = {
+        200: "OK",  # Успешный результат
+        201: "OK",  # Объект успешно создан
+        400: "BAD_REQUEST",  # Ошибка форматного контроля
+        401: "UNAUTHORIZED",  # Пользователь не авторизован
+        403: "FORBIDDEN",  # Доступ запрещен
+        404: "NOT_FOUND",  # Объект не найден
+        406: "NOT_ACCEPTABLE",  # Ошибка контроля целостности пакета данных
+        422: "FAILED_VALIDATION",  # Ошибка логического контроля
+        424: "SERVICE_ERROR",  # Ошибка при взаимодействии с внешним сервисом
+        500: "INTERNAL_SERVER_ERROR",  # Внутренняя ошибка
+        501: "NOT_IMPLEMENTED",  # Функциональность не реализована
+        503: "SERVICE_ERROR",  # Внешний компонент недоступен
+        504: "SERVICE_ERROR"  # Таймаут при обращении к внешнему компоненту
+    }
+
+    code = status_code_mapping.get(status, "OTHER_ERROR")
+
+    response = {
+        "detail": {
+            "code": code,
+            "message": message if message else ""
+        },
+        "data": data if data else {},
+        "info": {
+            "api_version": api_version
+        }
+    }
+    return response, status
+
+
+def validate_content_type():
+    """Проверяет, что заголовок Content-Type установлен в application/json."""
+    content_type = request.headers.get('Content-Type', '').strip()
+    if not content_type or content_type.lower() != 'application/json':
+        return wrap_response(
+            406,
+            "Некорректный заголовок Content-Type. Ожидается application/json"
+        )
+    return None
+
+
+def validate_project_id(project_id):
+    """Проверяет, что Project-ID корректен."""
+    if project_id not in VALID_PROJECT_IDS:
+        return wrap_response(
+            403,
+            "Неавторизованный доступ: неверный идентификатор Project-ID"
+        )
+    return None
+
+
+def validate_uuid(value, field_name):
+    """Проверяет, что значение является корректным UUID."""
+    if value is None:
+        return None
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        return wrap_response(
+            422,
+            f"Поле '{field_name}' должно быть в формате UUID. Некорректное значение: {value}"
+        )
+    return None
+
+
+def validate_auth_token():
+    """Проверяет корректность токена аутентификации."""
+    auth_header = request.headers.get('Authorization')
+    if not auth_header:
+        return wrap_response(
+            401,
+            "Неавторизованный доступ: отсутствует токен авторизации"
+        )
+    if auth_header not in VALID_TOKENS:
+        return wrap_response(
+            401,
+            "Неавторизованный доступ: некорректный токен авторизации"
+        )
+    return None
+
+
+def get_project_id_from_headers():
+    """Получает и проверяет Project-ID из заголовков запроса."""
+    project_id = request.headers.get('Project-ID')
+    if not project_id:
+        return None, wrap_response(
+            400,
+            "Отсутствует заголовок Project-ID"
+        )
+
+    validation_result = validate_project_id(project_id)
+    if validation_result:
+        return None, validation_result
+
+    return project_id, None
+
+
+# GET /reviews/ - Получить все отзывы для указанного project_id
+@reviews_ns.route('/')
+class ReviewsList(Resource):
+    @reviews_ns.expect(auth_parser)
+    @reviews_ns.response(200, 'Успешно получен список отзывов', reviews_response_model)
+    @reviews_ns.response(400, 'Ошибка форматного контроля', error_response_model)
+    @reviews_ns.response(401, 'Неавторизованный доступ', error_response_model)
+    @reviews_ns.response(403, 'Доступ запрещен', error_response_model)
+    @reviews_ns.response(404, 'Отзывы не найдены', error_response_model)
+    @reviews_ns.response(406, 'Некорректный Content-Type', error_response_model)
+    @reviews_ns.response(500, 'Внутренняя ошибка сервера', error_response_model)
+    def get(self):
+        """
+        Получить все отзывы для указанного project_id.
+
+        Требуемые заголовки:
+        - Authorization: Bearer <token>
+        - Project-ID: <uuid>
+        - Content-Type: application/json
+
+        Возвращает:
+        - 200: Список отзывов для указанного проекта
+        - 400: Отсутствует обязательный заголовок
+        - 401: Ошибка авторизации
+        - 403: Неверный идентификатор Project-ID
+        - 404: Отзывы не найдены
+        - 406: Некорректный Content-Type
+        - 500: Внутренняя ошибка сервера
+        """
+        # Проверка авторизации
+        auth_result = validate_auth_token()
+        if auth_result:
+            return auth_result
+
+        # Получаем и проверяем project_id из заголовков
+        project_id, error = get_project_id_from_headers()
+        if error:
+            return error
+
+        # Проверка корректности заголовка Content-Type
+        content_result = validate_content_type()
+        if content_result:
+            return content_result
+
+        # Вызов внешнего API вместо использования локального списка
+        data, error = call_external_api('GET', 'reviews', project_id=project_id)
+        if error:
+            return error
+
+        # Обработка ответа от внешнего API
+        if not data or not data.get('data'):
+            return wrap_response(
+                404,
+                f"Для проекта {project_id} отзывы не найдены"
+            )
+
+        return wrap_response(
+            200,
+            "Список отзывов получен",
+            data.get('data')
+        )
+
+
+# GET /reviews/<review_type> - Получить отзывы по типу
+@reviews_ns.route('/<string:review_type>')
+@reviews_ns.param('review_type', 'Тип отзыва (например, reviewlecture или reviewlecturer)')
+class ReviewsByType(Resource):
+    @reviews_ns.expect(auth_parser)
+    @reviews_ns.response(200, 'Успешно получен список отзывов по типу', reviews_response_model)
+    @reviews_ns.response(400, 'Ошибка форматного контроля', error_response_model)
+    @reviews_ns.response(401, 'Неавторизованный доступ', error_response_model)
+    @reviews_ns.response(403, 'Доступ запрещен', error_response_model)
+    @reviews_ns.response(404, 'Отзывы не найдены', error_response_model)
+    @reviews_ns.response(406, 'Некорректный Content-Type', error_response_model)
+    @reviews_ns.response(500, 'Внутренняя ошибка сервера', error_response_model)
+    def get(self, review_type):
+        """
+        Получить все отзывы для указанного project_id и review_type.
+
+        Требуемые заголовки:
+        - Authorization: Bearer <token>
+        - Project-ID: <uuid>
+        - Content-Type: application/json
+
+        Возвращает:
+        - 200: Список отзывов по указанному типу
+        - 400: Отсутствует обязательный заголовок
+        - 401: Ошибка авторизации
+        - 403: Неверный идентификатор Project-ID
+        - 404: Отзывы не найдены
+        - 406: Некорректный Content-Type
+        - 500: Внутренняя ошибка сервера
+        """
+        # Проверка авторизации
+        auth_result = validate_auth_token()
+        if auth_result:
+            return auth_result
+
+        # Получаем и проверяем project_id из заголовков
+        project_id, error = get_project_id_from_headers()
+        if error:
+            return error
+
+        # Проверка корректности заголовка Content-Type
+        content_result = validate_content_type()
+        if content_result:
+            return content_result
+
+        # Вызов внешнего API
+        params = {'review_type': review_type}
+        data, error = call_external_api('GET', f'reviews/{review_type}', project_id=project_id)
+        if error:
+            return error
+
+        # Обработка ответа от внешнего API
+        if not data or not data.get('data'):
+            return wrap_response(
+                404,
+                f"Отзывы для типа {review_type} в проекте {project_id} не найдены"
+            )
+
+        return wrap_response(
+            200,
+            "Список отзывов получен",
+            data.get('data')
+        )
+
+
+# GET /reviews/<review_type>/<item> - Получить отзывы по типу и ID объекта
+@reviews_ns.route('/<string:review_type>/<string:item>')
+@reviews_ns.param('review_type', 'Тип отзыва (например, reviewlecture или reviewlecturer)')
+@reviews_ns.param('item', 'ID объекта (например, идентификатор лекции или лектора)')
+class ReviewByTypeAndObject(Resource):
+    @reviews_ns.expect(auth_parser)
+    @reviews_ns.response(200, 'Успешно получен список отзывов по типу и ID объекта', reviews_response_model)
+    @reviews_ns.response(400, 'Ошибка форматного контроля', error_response_model)
+    @reviews_ns.response(401, 'Неавторизованный доступ', error_response_model)
+    @reviews_ns.response(403, 'Доступ запрещен', error_response_model)
+    @reviews_ns.response(404, 'Отзывы не найдены', error_response_model)
+    @reviews_ns.response(406, 'Некорректный Content-Type', error_response_model)
+    @reviews_ns.response(422, 'Некорректный UUID', error_response_model)
+    @reviews_ns.response(500, 'Внутренняя ошибка сервера', error_response_model)
+    def get(self, review_type, item):
+        """
+        Получить отзывы по типу и ID объекта.
+
+        Требуемые заголовки:
+        - Authorization: Bearer <token>
+        - Project-ID: <uuid>
+        - Content-Type: application/json
+
+        Возвращает:
+        - 200: Список отзывов по типу и ID объекта
+        - 400: Отсутствует обязательный заголовок
+        - 401: Ошибка авторизации
+        - 403: Неверный идентификатор Project-ID
+        - 404: Отзывы не найдены
+        - 406: Некорректный Content-Type
+        - 422: Некорректный UUID параметр
+        - 500: Внутренняя ошибка сервера
+        """
+        # Проверяем авторизацию
+        auth_result = validate_auth_token()
+        if auth_result:
+            return auth_result
+
+        # Получаем и проверяем project_id из заголовков
+        project_id, error = get_project_id_from_headers()
+        if error:
+            return error
+
+        # Проверяем корректность заголовка Content-Type
+        content_result = validate_content_type()
+        if content_result:
+            return content_result
+
+        # Проверяем формат UUID для item
+        uuid_result = validate_uuid(item, 'item')
+        if uuid_result:
+            return uuid_result
+
+        # Вызов внешнего API
+        data, error = call_external_api('GET', f'reviews/{review_type}/{item}', project_id=project_id)
+        if error:
+            return error
+
+        # Обработка ответа от внешнего API
+        if not data or not data.get('data'):
+            return wrap_response(
+                404,
+                "Отзывы не найдены"
+            )
+
+        return wrap_response(
+            200,
+            "Список отзывов получен",
+            data.get('data')
+        )
+
+
+# POST /review/ - Добавить новый отзыв
+@review_ns.route('/')
+class ReviewAdd(Resource):
+    @review_ns.expect(auth_parser, review_create_model)
+    @review_ns.response(201, 'Отзыв успешно создан', review_response_model)
+    @review_ns.response(400, 'Ошибка форматного контроля', error_response_model)
+    @review_ns.response(401, 'Неавторизованный доступ', error_response_model)
+    @review_ns.response(403, 'Доступ запрещен', error_response_model)
+    @review_ns.response(406, 'Некорректный Content-Type', error_response_model)
+    @review_ns.response(422, 'Ошибка валидации данных', error_response_model)
+    @review_ns.response(500, 'Внутренняя ошибка сервера', error_response_model)
+    def post(self):
+        """
+        Добавить новый отзыв.
+
+        Требуемые заголовки:
+        - Authorization: Bearer <token>
+        - Project-ID: <uuid>
+        - Content-Type: application/json
+
+        Тело запроса должно соответствовать модели ReviewCreate.
+
+        Возвращает:
+        - 201: Отзыв успешно создан
+        - 400: Отсутствует обязательный заголовок
+        - 401: Ошибка авторизации
+        - 403: Неверный идентификатор Project-ID
+        - 406: Некорректный Content-Type
+        - 422: Ошибка валидации данных
+        - 500: Внутренняя ошибка сервера
+        """
+        # Проверка авторизации
+        auth_result = validate_auth_token()
+        if auth_result:
+            return auth_result
+
+        # Получаем и проверяем project_id из заголовков
+        project_id, error = get_project_id_from_headers()
+        if error:
+            return error
+
+        # Проверка корректности заголовка Content-Type
+        content_result = validate_content_type()
+        if content_result:
+            return content_result
+
+        try:
+            data = request.get_json()
+
+            # Валидация UUID для item
+            item = data.get('item')
+            if not item:
+                return wrap_response(422, "Отсутствует обязательное поле 'item'")
+
+            uuid_result = validate_uuid(item, 'item')
+            if uuid_result:
+                return uuid_result
+
+            # Валидация UUID для user_id
+            user_id = data.get('user_id')
+            if not user_id:
+                return wrap_response(422, "Отсутствует обязательное поле 'user_id'")
+
+            uuid_result = validate_uuid(user_id, 'user_id')
+            if uuid_result:
+                return uuid_result
+
+            # Проверка наличия всех необходимых полей
+            if 'review_type' not in data:
+                return wrap_response(422, "Отсутствует обязательное поле 'review_type'")
+            if 'data' not in data:
+                return wrap_response(422, "Отсутствует обязательное поле 'data'")
+            if 'scale' not in data['data']:
+                return wrap_response(422, "Отсутствует обязательное поле 'scale' в data")
+            if 'text' not in data['data']:
+                return wrap_response(422, "Отсутствует обязательное поле 'text' в data")
+            if 'reviewer' not in data['data']:
+                return wrap_response(422, "Отсутствует обязательное поле 'reviewer' в data")
+
+            # Добавляем project_id к данным для отправки
+            request_data = {
+                'project_id': project_id,
+                'user_id': user_id,
+                'review_type': data['review_type'],
+                'item': data['item'],
+                'data': data['data']
+            }
+
+            # Отправляем запрос к внешнему API
+            result, error = call_external_api('POST', 'review', data=request_data, project_id=project_id)
+            if error:
+                return error
+
+            # Обработка успешного ответа
+            return wrap_response(
+                201,
+                "Отзыв успешно создан",
+                result.get('data')
+            )
+        except KeyError as e:
+            return wrap_response(422, f"Отсутствует обязательное поле: {str(e)}")
+        except Exception as e:
+            return wrap_response(500, f"Внутренняя ошибка сервера: {str(e)}")
+
+
+# DELETE /review/<review_id> - Удалить отзыв по ID
+@review_ns.route('/<string:review_id>')
+@review_ns.param('review_id', 'ID отзыва для удаления')
+class ReviewDelete(Resource):
+    @review_ns.expect(auth_parser)
+    @review_ns.response(200, 'Отзыв успешно удален', api_response_model)
+    @review_ns.response(400, 'Ошибка форматного контроля', error_response_model)
+    @review_ns.response(401, 'Неавторизованный доступ', error_response_model)
+    @review_ns.response(403, 'Доступ запрещен', error_response_model)
+    @review_ns.response(404, 'Отзыв не найден', error_response_model)
+    @review_ns.response(406, 'Некорректный Content-Type', error_response_model)
+    @review_ns.response(422, 'Некорректный UUID', error_response_model)
+    @review_ns.response(500, 'Внутренняя ошибка сервера', error_response_model)
+    def delete(self, review_id):
+        """
+        Удалить отзыв по ID.
+
+        Требуемые заголовки:
+        - Authorization: Bearer <token>
+        - Project-ID: <uuid>
+        - Content-Type: application/json
+
+        Возвращает:
+        - 200: Отзыв успешно удален
+        - 400: Отсутствует обязательный заголовок
+        - 401: Ошибка авторизации
+        - 403: Неверный идентификатор Project-ID
+        - 404: Отзыв не найден
+        - 406: Некорректный Content-Type
+        - 422: Некорректный UUID
+        - 500: Внутренняя ошибка сервера
+        """
+        # Проверка авторизации
+        auth_result = validate_auth_token()
+        if auth_result:
+            return auth_result
+
+        # Получаем и проверяем project_id из заголовков
+        project_id, error = get_project_id_from_headers()
+        if error:
+            return error
+
+        # Проверка корректности заголовка Content-Type
+        content_result = validate_content_type()
+        if content_result:
+            return content_result
+
+        # Проверка формата UUID для review_id
+        uuid_result = validate_uuid(review_id, 'review_id')
+        if uuid_result:
+            return uuid_result
+
+        # Отправляем запрос на удаление к внешнему API
+        result, error = call_external_api('DELETE', f'review/{review_id}', project_id=project_id)
+        if error:
+            return error
+
+        # Если API вернул ошибку 404, обрабатываем её
+        if result and result.get('detail', {}).get('code') == "NOT_FOUND":
+            return wrap_response(
+                404,
+                f"Отзыв с ID {review_id} в проекте {project_id} не найден"
+            )
+
+        return wrap_response(
+            200,
+            "Отзыв успешно удален"
+        )
+
+
+# Обработчик ошибок для неправильных URL
+@app.errorhandler(404)
+def not_found(error):
+    return wrap_response(404, "Запрашиваемый ресурс не найден")
+
+
+# Обработчик ошибок для неправильного метода
+@app.errorhandler(405)
+def method_not_allowed(error):
+    return wrap_response(405, "Метод не разрешен для указанного ресурса")
+
+
+# Обработчики ошибок для взаимодействия с внешним API
+@app.errorhandler(requests.exceptions.ConnectionError)
+def handle_connection_error(error):
+    return wrap_response(503, "Внешний API недоступен")
+
+
+@app.errorhandler(requests.exceptions.Timeout)
+def handle_timeout_error(error):
+    return wrap_response(504, "Превышено время ожидания ответа от внешнего API")
+
+
+@app.errorhandler(requests.exceptions.RequestException)
+def handle_request_exception(error):
+    return wrap_response(500, f"Ошибка при обращении к внешнему API: {str(error)}")
+
+
+# Обработчик для общих ошибок
+@app.errorhandler(Exception)
+def handle_exception(error):
+    return wrap_response(500, f"Внутренняя ошибка сервера: {str(error)}")
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
